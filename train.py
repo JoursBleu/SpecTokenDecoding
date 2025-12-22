@@ -45,26 +45,68 @@ class DynamicSpeculativeDataset(Dataset):
         while True:
             try:
                 example = next(self.iter)
-                text = example.get("text", "").strip()
-                if not text:
+                if "conversations" in example:
+                    conversations = example["conversations"]
+                    # 至少需要一轮问答（user + assistant）
+                    if len(conversations) < 2:
+                        continue
+                    # 只取第一轮
+                    first_turn = conversations[0]
+                    second_turn = conversations[1]
+                    
+                    # 验证角色顺序：user -> assistant
+                    if not (first_turn.get("from", "").lower() in ("human", "user") and
+                            second_turn.get("from", "").lower() in ("gpt", "assistant")):
+                        continue  # skip malformed
+
+                    messages = [
+                        {"role": "user", "content": first_turn["value"].strip()},
+                        {"role": "assistant", "content": second_turn["value"].strip()}
+                    ]
+                    messages_user = [
+                        {"role": "user", "content": first_turn["value"].strip()},
+                    ]
+                    
+                    if not messages[0]["content"] or not messages[1]["content"]:
+                        continue
+                    
+                    text = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    text_user = self.tokenizer.apply_chat_template(
+                        messages_user,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                else:
                     continue
+
+                if not text.strip():
+                    continue
+
                 tokens = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-                min_len = self.args.max_context + self.args.spec_depth + 10
-                if len(tokens) < min_len:
+                tokens_user = self.tokenizer(text_user, add_special_tokens=False)["input_ids"][:-3]
+                len_user = len(tokens_user)
+                if len(tokens) - len_user < self.args.spec_depth:
                     continue
-
-                start = random.randint(0, len(tokens) - min_len)
-                context = tokens[start : start + self.args.max_context]
-                future = tokens[start + self.args.max_context : start + self.args.max_context + self.args.spec_depth]
-
+                start = random.randint(0, len(tokens) - len_user - self.args.spec_depth) + len_user
+                context = tokens[:start]
                 input_ids = context + self.spec_token_ids
-
+                base_input_ids = tokens[:start+self.args.spec_depth]
+                if len(input_ids) > 2048:
+                    continue
                 return {
-                    "base_input_ids": torch.tensor(tokens[start:start+len(input_ids)], dtype=torch.long),
+                    "base_input_ids": torch.tensor(base_input_ids, dtype=torch.long),
                     "input_ids": torch.tensor(input_ids, dtype=torch.long),
                 }
+
             except StopIteration:
                 self.iter = iter(self.dataset.shuffle(buffer_size=self.args.shuffle_buffer))
+            except Exception:
+                continue
+
 
 def collate_fn(batch, tokenizer):
     base_input_ids = [item["base_input_ids"] for item in batch]
@@ -298,7 +340,7 @@ def main():
     # === Optimizer ===
     print("=== Optimizer ===")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0.01)
-    num_warmup_steps = int(args.num_steps*0.03)
+    num_warmup_steps = int(args.num_steps*0.05)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=num_warmup_steps,
