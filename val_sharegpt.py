@@ -2,6 +2,7 @@
 import os
 import argparse
 import torch
+import time
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
@@ -82,61 +83,76 @@ def parse_args():
     return parser.parse_args()
 
 @torch.no_grad()
-def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer, device):
+def speculative_decode(draft_model, input_ids, max_new_tokens, spec_depth, tokenizer, device, base_model):
     """
     Simulate speculative decoding with ground-truth future for acceptance rate calculation.
     """
     input_ids = input_ids.to(device)  # [C]
+    print("seq", tokenizer.decode(input_ids[0]))
 
     base_tokens = base_model.generate(
         input_ids,
         do_sample=False,
-        max_new_tokens=128,
+        max_new_tokens=max_new_tokens,
         pad_token_id=draft_model.config.pad_token_id,
         eos_token_id=draft_model.config.eos_token_id,
     )  # [1, C + K]
 
+    # draft_gen_tokens = draft_model.generate(
+        # input_ids,
+        # do_sample=False,
+        # max_new_tokens=max_new_tokens,
+        # pad_token_id=draft_model.config.pad_token_id,
+        # eos_token_id=draft_model.config.eos_token_id,
+    # )  # [1, C + K]
+
+    draft_gen_tokens = input_ids.clone()
+    context_out = draft_model(input_ids=draft_gen_tokens, use_cache=True, logits_to_keep=[-1])
+    past_key_values = context_out.past_key_values
+    new_token = torch.argmax(context_out.logits, dim=-1)
+    draft_gen_tokens = torch.cat((draft_gen_tokens, new_token), dim=-1)
+    while draft_gen_tokens.shape[1] - input_ids.shape[1] < max_new_tokens:
+        out = draft_model(
+            input_ids=new_token,
+            past_key_values=past_key_values,
+            use_cache=True
+        )
+        past_key_values = out.past_key_values
+        new_token = torch.argmax(out.logits, dim=-1)
+        draft_gen_tokens = torch.cat((draft_gen_tokens, new_token), dim=-1)
+        if draft_model.config.eos_token_id == new_token:
+            break
+
     spec_token_ids = tokenizer.convert_tokens_to_ids(
         [f"<|spec_{i}|>" for i in range(1, spec_depth + 1)]
     )
+    spec_token_ids = torch.tensor(spec_token_ids,dtype=input_ids.dtype, device=input_ids.device).view(1, spec_depth)
+    logits_to_keep = [-i for i in range(spec_depth+1, 0, -1)]
     start_time = time.time()
     step_count = 0
     cur_ids = input_ids.clone()
 
     draft_input_ids = torch.cat((cur_ids, spec_token_ids), dim=-1)
-    context_out = draft_model(input_ids=draft_input_ids, use_cache=True)
+    context_out = draft_model(input_ids=draft_input_ids, use_cache=True, logits_to_keep=logits_to_keep)
     kv_cache = context_out.past_key_values
-    draft_logits = context_out.logits
-    draft_probs = torch.softmax(draft_logits[:,-(spec_depth+1),:], dim=-1)
-    draft_tokens = torch.multinomial(draft_probs.view(-1, draft_probs.size(-1)), 1).view(draft_probs.shape[0], -1)
+    draft_tokens = torch.argmax(context_out.logits, dim=-1)
     kv_cache.crop(cur_ids.shape[1])
 
     while cur_ids.shape[1] - input_ids.shape[1] < max_new_tokens:
-        breakpoint()
         assert(draft_tokens.shape[1] == spec_depth+1)
-        assert(kv_cache.seq_length() == cur_ids.shape[1])
         verify_out = draft_model(
             input_ids=draft_tokens,
-            do_sample=False,
             past_key_values=kv_cache,
             use_cache=True
         )
-        verify_logits = verify_out.logits
         kv_cache = verify_out.past_key_values
-        verify_probs = torch.softmax(verify_logits, dim=-1)
-        verify_tokens = torch.multinomial(verify_probs.view(-1, verify_probs.size(-1)), 1).view(verify_probs.shape[0], -1)
+        verify_tokens = torch.argmax(verify_out.logits, dim=-1)
 
-        posterior_mask = (draft_tokens[:, 1:] == verify_tokens[:, :draft_len]).int()
+        posterior_mask = (draft_tokens[:, 1:] == verify_tokens[:, :spec_depth]).int()
         accept_length = (torch.cumprod(posterior_mask, dim=-1)).sum(dim=1)+1
         cur_ids = torch.cat((cur_ids, draft_tokens[:, :accept_length]), dim=-1)
         kv_cache.crop(cur_ids.shape[1])
         new_token = verify_tokens[:, accept_length-1]
-
-        draft_input_ids = torch.cat((new_token, spec_token_ids), dim=-1)
-        draft_out = draft_model(input_ids=draft_input_ids, past_key_values=kv_cache, use_cache=True)
-        draft_logits = draft_out.logits
-        draft_prob = torch.softmax(draft_logits, dim=-1)
-        draft_tokens = torch.multinomial(draft_prob.view(-1, draft_prob.size(-1)), 1).view(draft_prob.shape[0], -1)
 
         # print("draft_tokens", draft_tokens)
         # print("verify_tokens", verify_tokens)
@@ -146,14 +162,27 @@ def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer
         # print("seqlen", cur_ids.shape[1])
         # print("seq", tokenizer.decode(cur_ids[0]))
 
+        draft_input_ids = torch.cat((new_token, spec_token_ids), dim=-1)
+        draft_out = draft_model(input_ids=draft_input_ids, past_key_values=kv_cache, use_cache=True, logits_to_keep=logits_to_keep)
+        kv_cache = draft_out.past_key_values
+        draft_tokens = torch.argmax(draft_out.logits, dim=-1)
+        cur_ids = torch.cat((cur_ids, new_token), dim=-1)
+        kv_cache.crop(cur_ids.shape[1])
+        accept_length += 1
+
         step_count += 1
 
-        if base_model.config.eos_token_id in cur_ids.cpu().tolist() or base_model.config.eos_token_id == new_token:
+        if draft_model.config.eos_token_id in cur_ids.cpu().tolist() or draft_model.config.eos_token_id == new_token:
             break
 
     end_time = time.time()
+    new_token_count = cur_ids.shape[1] - input_ids.shape[1]
+    if((draft_gen_tokens != cur_ids[:, :draft_gen_tokens.shape[1]]).sum()):
+        print("base_tokens", base_tokens[:, -128:])
+        print("draft_gen_tokens", draft_gen_tokens[:, -128:])
+        print("cur_ids", cur_ids[:, -new_token_count:])
 
-    return accepted, aligned_base
+    return step_count, new_token_count
 
 def main():
     args = parse_args()
@@ -177,6 +206,7 @@ def main():
     )
     if args.use_lora:
         draft_model = PeftModel.from_pretrained(draft_base, args.draft_model_path)
+        draft_model = draft_model.merge_and_unload()
     else:
         state_dict = torch.load(os.path.join(args.draft_model_path, "pytorch_model.bin"), map_location="cpu")
         draft_base.load_state_dict(state_dict)
@@ -188,7 +218,7 @@ def main():
     trainable_path = os.path.join(args.draft_model_path, "trainable_base_params.bin")
     if os.path.exists(trainable_path):
         trainable_state = torch.load(trainable_path, map_location="cpu")
-        draft_model.load_state_dict(trainable_state, strict=False)  # only load matching keys
+        draft_model.model.spec_embed_tokens.data = trainable_state['base_model.model.model.spec_embed_tokens']
     draft_model.to(device).eval()
 
 
@@ -196,36 +226,42 @@ def main():
     dataset = SpecValidationDataset(tokenizer, args)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
-    total_accepted = 0
-    total_aligned = 0
-    total_drafts = 0
     count = 0
+    total_step_count = 0
+    total_new_token_count = 0
 
     print(f"Evaluating {args.num_samples} samples...")
     for batch in dataloader:
         if count >= args.num_samples:
             break
 
-        accepted, aligned_base = speculative_decode(
-            base_model, draft_model, batch["input_ids"], args.spec_depth, tokenizer, device
+        input_ids = batch["input_ids"]
+        if torch.isinf(input_ids).sum().item() or torch.isnan(input_ids).sum().item():
+            print("input_ids", input_ids, flush=True)
+            breakpoint()
+
+        step_count, new_token_count = speculative_decode(
+            draft_model,
+            input_ids,
+            args.max_new_tokens,
+            args.spec_depth,
+            tokenizer, device,
+            base_model,
         )
-        total_accepted += accepted
-        total_drafts += args.spec_depth
-        total_aligned += aligned_base
+        total_new_token_count += new_token_count
+        total_step_count += step_count
+        total_tps = total_new_token_count / total_step_count / 2
+        # total_aligned += aligned_base
         count += 1
 
-        print(f"Processed {count} samples, current acceptance rate: {total_accepted / total_drafts:.2%}, current aligned rate: {total_aligned / total_drafts:.2%}")
+        print(f"Processed {count} samples, new tokens: {new_token_count}, tps: {new_token_count / step_count / 2}, avg tps: {total_tps}")
 
-    acceptance_rate = total_accepted / total_drafts
-    avg_accepted_per_step = total_accepted / count
 
     print("\n" + "="*50)
     print(f"Speculative Decoding Evaluation Results")
     print(f"Spec depth: {args.spec_depth}")
     print(f"Samples: {count}")
-    print(f"Average accepted tokens per draft: {avg_accepted_per_step:.2f} / {args.spec_depth}")
-    print(f"Acceptance rate: {acceptance_rate:.2%}")
-    print(f"Average aligned tokens: {total_aligned / count:.3}")
+    print(f"TPS: {total_tps}")
     print("="*50)
 
 if __name__ == "__main__":

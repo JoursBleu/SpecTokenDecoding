@@ -16,6 +16,7 @@ python val_sharegpt.py \
   --dataset_name ../data/ShareGPT_Vicuna_unfiltered \
   --dataset_split "train" \
   --use_lora \
+  --max_new_tokens 64 \
   --spec_depth ${SPEC_LEN}
 
 

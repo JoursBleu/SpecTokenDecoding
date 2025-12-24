@@ -151,6 +151,8 @@ def parse_args():
     parser.add_argument("--warmup_ploss_weight", type=float, default=None, help="Weight for probability loss")
     parser.add_argument("--vloss_weight", type=float, default=0.01, help="Weight for hidden state loss")
     parser.add_argument("--ploss_weight", type=float, default=1.0, help="Weight for probability loss")
+    parser.add_argument("--bellman_weight", type=float, default=0.1)
+    parser.add_argument("--energy_rank_weight", type=float, default=0.05)
     parser.add_argument("--temperature", type=float, default=1.0, help="Distillation temperature")
     parser.add_argument("--lora_layer_ratio", type=float, default=0.25,
                         help="Ratio of layers (from the end) to apply LoRA. "
@@ -186,13 +188,13 @@ def compute_loss(targets, target_logits, predicts, predict_logits, hidden_layers
         # target_probs,
         # reduction='sum'
     # ) * (temperature ** 2) / (target_probs.shape[0] * target_probs.shape[1])
-    ploss = F.smooth_l1_loss(predict_logits, target_logits, reduction='mean')
+    ploss = F.smooth_l1_loss(predict_logits[:,-spec_depth:,:], target_logits[:,-spec_depth:,:], reduction='mean')
 
     # 2. Hidden state alignment via SmoothL1Loss
-    selected_targets = [targets[i][:,-spec_depth:,:] for i in hidden_layers]
-    selected_predicts = [predicts[i][:,-spec_depth:,:] for i in hidden_layers]
+    selected_targets = [targets[i][:,:-spec_depth,:] for i in hidden_layers]
+    selected_predicts = [predicts[i][:,:-spec_depth,:] for i in hidden_layers]
     vloss = 0.0
-    for predict,target in zip(selected_predicts,selected_targets):
+    for predict,target in zip(selected_predicts, selected_targets):
         vloss += F.smooth_l1_loss(predict, target, reduction='mean')
     vloss = vloss / len(selected_predicts)  # average over layers
 
@@ -277,7 +279,14 @@ def main():
         spec_tokens = [f"<|spec_{i}|>" for i in range(1, args.spec_depth + 1)]
         num_added = tokenizer.add_tokens(spec_tokens, special_tokens=True)
         # model.resize_token_embeddings(len(tokenizer))
-        spec_embed_tokens = st_model.model.embed_tokens.weight[tokenizer.eos_token_id].unsqueeze(0).repeat(args.spec_depth, 1)
+        sampled_token_ids = torch.randint(
+            low=0,
+            high=128256,
+            size=(args.spec_depth, 16),
+            device=st_model.model.embed_tokens.weight.device
+        )
+        sampled_embeddings = st_model.model.embed_tokens(sampled_token_ids)
+        spec_embed_tokens = sampled_embeddings.mean(dim=1)
         st_model.model.spec_embed_tokens = torch.nn.Parameter(spec_embed_tokens.clone())
 
         # === LoRA ===
@@ -389,6 +398,9 @@ def main():
             # past_key_values.crop(base_input_ids.shape[1] - args.spec_depth)  # [B, L, D]，或选某一层
             base_logits = base_outputs.logits  # [B, L, V]
             base_hidden = base_outputs.hidden_states  # [B, L, D]，或选某一层
+            # 从 base 模型提取 reward r
+            V_base = torch.logsumexp(base_logits, dim=-1)  # [B, L]
+            reward_r = base_logits - V_base.unsqueeze(-1)         # [B, L, V]
 
         optimizer.zero_grad()
         st_outputs = model(
@@ -401,6 +413,55 @@ def main():
         st_logits = st_outputs.logits  # [B, L, V]
         st_hidden = st_outputs.hidden_states
         vloss, ploss = compute_loss(base_hidden, base_logits, st_hidden, st_logits, args.hidden_layers, args.spec_depth, temperature=args.temperature)
+
+        # === Bellman loss (corrected) ===
+        V_student = torch.logsumexp(st_logits / args.temperature, dim=-1) * args.temperature  # [B, L]
+        # Align lengths: reward_r corresponds to base_logits[:, :-1] (shifted)
+        # Assume base_input_ids includes full sequence => ground truth next tokens are base_input_ids[:, 1:]
+        base_gt_tokens = base_input_ids[:, 1:]                     # [B, L_base-1]
+        base_logits_shifted = base_logits[:, :-1, :]               # [B, L_base-1, V]
+        reward_r_shifted = reward_r[:, :-1, :]                     # [B, L_base-1, V]
+
+        # For alignment, assume spec region in base corresponds to last args.spec_depth tokens
+        spec_start = -args.spec_depth
+        # Student spec logits (where it predicts draft tokens)
+        st_spec_logits = st_logits[:, spec_start:, :]              # [B, K, V]
+        # Base spec region (last K tokens of base response, excluding EOS if needed)
+        base_spec_reward = reward_r_shifted[:, spec_start:, :]     # [B, K, V]
+        base_spec_gt = base_gt_tokens[:, spec_start:]              # [B, K]
+
+        # Student-generated draft tokens (greedy)
+        student_spec_tokens = torch.argmax(st_spec_logits, dim=-1)  # [B, K]
+
+        # === Bellman loss: q_student ≈ r_base + V_student_next ===
+        V_student_spec_next = V_student[:, spec_start+1:]          # [B, K-1]
+        V_student_spec_next = torch.cat([V_student_spec_next, torch.zeros_like(V_student_spec_next[:, :1])], dim=1)  # pad last as 0
+        target_q = base_spec_reward + V_student_spec_next.unsqueeze(-1)  # [B, K, V]
+        bloss = F.smooth_l1_loss(
+            st_spec_logits,
+            target_q.detach(),
+            reduction="mean"
+        )
+
+        # === Energy Ranking Loss (EBM-consistent, reward-based) ===
+        # Total reward of base ground-truth path in spec region
+        R_base = torch.gather(
+            base_spec_reward,
+            dim=-1,
+            index=base_spec_gt.unsqueeze(-1)
+        ).squeeze(-1).sum(dim=-1)  # [B]
+
+        # Total reward of student draft path (evaluated under base reward r)
+        R_student = torch.gather(
+            base_spec_reward,
+            dim=-1,
+            index=student_spec_tokens.unsqueeze(-1)
+        ).squeeze(-1).sum(dim=-1)  # [B]
+
+        # Encourage student path to have reward ≥ base path - margin
+        margin = getattr(args, 'energy_ranking_margin', 1.0)
+        eloss = F.relu(margin + R_base.detach() - R_student).mean()
+
         vloss_weight = args.vloss_weight
         ploss_weight = args.ploss_weight
         if step < num_warmup_steps:
@@ -408,16 +469,24 @@ def main():
                 vloss_weight = args.warmup_vloss_weight
             if args.warmup_ploss_weight is not None:
                 ploss_weight = args.warmup_ploss_weight
-        loss = vloss * vloss_weight + ploss * ploss_weight
+        loss = (
+            vloss * vloss_weight
+            + ploss * ploss_weight
+            + bloss * args.bellman_weight
+            + eloss * args.energy_rank_weight
+        )
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
         if rank == 0 and step % args.logging_steps == 0:
-            print(f"Step {step}, LR: {scheduler.get_last_lr()[0]:.2e}, Loss: {loss.item():.4f}, VLoss: {vloss.item():.4f}, PLoss: {ploss.item():.4f}")
+            print(f"Step {step}, LR: {scheduler.get_last_lr()[0]:.2e}, Loss: {loss.item():.4f}, VLoss: {vloss.item():.4f}, PLoss: {ploss.item():.4f}, BLoss: {bloss.item():.4f}, ELoss: {eloss.item():.4f}")
             writer.add_scalar("Loss/Total", loss.item(), step)
             writer.add_scalar("Loss/VLoss", vloss.item(), step)
             writer.add_scalar("Loss/PLoss", ploss.item(), step)
+            writer.add_scalar("Loss/BLoss", bloss.item(), step)
+            writer.add_scalar("Loss/ELoss", eloss.item(), step)
             writer.add_scalar("LR", scheduler.get_last_lr()[0], step)
 
         if rank == 0 and step > 0 and step % args.save_steps == 0:

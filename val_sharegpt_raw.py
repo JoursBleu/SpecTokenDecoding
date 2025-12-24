@@ -82,8 +82,12 @@ class SpecValidationDataset(Dataset):
                 base_input_ids = tokens[:start+self.args.spec_depth]
                 if len(input_ids) > 2048:
                     continue
+                input_ids = torch.tensor(input_ids, dtype=torch.long)
+                # if any(torch.isinf(input_ids).item() or any(torch.isnan(input_ids)).item()):
+                    # print("input_ids", input_ids, flush=True)
+                    # continue
                 return {
-                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                    "input_ids": input_ids,
                 }
 
             except Exception:
@@ -116,7 +120,7 @@ def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer
     base_tokens = base_model.generate(
         input_ids[:, :-spec_depth],
         do_sample=False,
-        max_new_tokens=spec_depth,
+        max_new_tokens=spec_depth+1,
         pad_token_id=draft_model.config.pad_token_id,
         eos_token_id=draft_model.config.eos_token_id,
     )  # [1, C + K]
@@ -125,21 +129,21 @@ def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer
     target_tokens = draft_model.generate(
         input_ids[:, :-spec_depth],
         do_sample=False,
-        max_new_tokens=spec_depth,
+        max_new_tokens=spec_depth+1,
         pad_token_id=draft_model.config.pad_token_id,
         eos_token_id=draft_model.config.eos_token_id,
     )  # [1, C + K]
 
     # Step 2: Draft model predicts K tokens
     logits = draft_model(input_ids=input_ids).logits
-    spec_tokens = logits.argmax(dim=-1)
+    spec_tokens = torch.argmax(logits, dim=-1)
 
-    aligned_base = (target_tokens[:, -spec_depth:] == base_tokens[:, -spec_depth:]).sum().item()
-    accepted = (target_tokens[:, -spec_depth:] == spec_tokens[:, -spec_depth-1:-1]).sum().item()
-    print("base", base_tokens[:, -spec_depth:])
-    print("base text:", tokenizer.decode(base_tokens[0, -spec_depth:]))
-    print("target", target_tokens[:, -spec_depth:])
-    print("target text:", tokenizer.decode(target_tokens[0, -spec_depth:]))
+    aligned_base = (target_tokens[:, -spec_depth-1:] == base_tokens[:, -spec_depth-1:]).sum().item()
+    accepted = (target_tokens[:, -spec_depth-1:] == spec_tokens[:, -spec_depth-1:]).sum().item()
+    print("base", base_tokens[:, -spec_depth-1:])
+    print("base text:", tokenizer.decode(base_tokens[0, -spec_depth-1:]))
+    print("target", target_tokens[:, -spec_depth-1:])
+    print("target text:", tokenizer.decode(target_tokens[0, -spec_depth-1:]))
     print("draft", spec_tokens[:, -spec_depth-1:])
     print("draft text:", tokenizer.decode(spec_tokens[0, -spec_depth-1:]))
     
@@ -170,6 +174,7 @@ def main():
     )
     if args.use_lora:
         draft_model = PeftModel.from_pretrained(draft_base, args.draft_model_path)
+        draft_model = draft_model.merge_and_unload()
     else:
         state_dict = torch.load(os.path.join(args.draft_model_path, "pytorch_model.bin"), map_location="cpu")
         draft_base.load_state_dict(state_dict)
@@ -181,7 +186,7 @@ def main():
     trainable_path = os.path.join(args.draft_model_path, "trainable_base_params.bin")
     if os.path.exists(trainable_path):
         trainable_state = torch.load(trainable_path, map_location="cpu")
-        draft_model.load_state_dict(trainable_state, strict=False)  # only load matching keys
+        draft_model.model.spec_embed_tokens.data = trainable_state['base_model.model.model.spec_embed_tokens']
     draft_model.to(device).eval()
 
 
@@ -203,7 +208,7 @@ def main():
             base_model, draft_model, batch["input_ids"], args.spec_depth, tokenizer, device
         )
         total_accepted += accepted
-        total_drafts += args.spec_depth
+        total_drafts += args.spec_depth + 1
         total_aligned += aligned_base
         count += 1
 
@@ -216,7 +221,7 @@ def main():
     print(f"Speculative Decoding Evaluation Results")
     print(f"Spec depth: {args.spec_depth}")
     print(f"Samples: {count}")
-    print(f"Average accepted tokens per draft: {avg_accepted_per_step:.2f} / {args.spec_depth}")
+    print(f"Average accepted tokens per draft: {avg_accepted_per_step:.2f} / {args.spec_depth+1}")
     print(f"Acceptance rate: {acceptance_rate:.2%}")
     print(f"Average aligned tokens: {total_aligned / count:.3}")
     print("="*50)
