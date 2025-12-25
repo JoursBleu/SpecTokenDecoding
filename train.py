@@ -89,18 +89,34 @@ class DynamicSpeculativeDataset(Dataset):
                 tokens = self.tokenizer(text, add_special_tokens=False)["input_ids"]
                 tokens_user = self.tokenizer(text_user, add_special_tokens=False)["input_ids"][:-3]
                 len_user = len(tokens_user)
-                if len(tokens) - len_user < self.args.spec_depth:
+                if len(tokens) - len_user < self.args.spec_depth + 1:
                     continue
-                start = random.randint(0, len(tokens) - len_user - self.args.spec_depth) + len_user
+                start = random.randint(0, len(tokens) - len_user - self.args.spec_depth - 1) + len_user
                 context = tokens[:start]
                 input_ids = context + self.spec_token_ids
                 base_input_ids = tokens[:start+self.args.spec_depth]
+                labels = tokens[1:start+self.args.spec_depth+1]
                 if len(input_ids) > 2048:
                     continue
-                return {
-                    "base_input_ids": torch.tensor(base_input_ids, dtype=torch.long),
-                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                }
+                if idx % 2:
+                    input_ids = torch.tensor(input_ids, dtype=torch.long)
+                    loss_mask = torch.zeros(input_ids.shape, dtype=torch.bool)
+                    loss_mask[:, -self.args.spec_depth:] = True
+                    return {
+                        "input_ids": input_ids,
+                        "labels": torch.tensor(labels, dtype=torch.long),
+                        "loss_mask": loss_mask,
+                        "is_spec": True
+                    }
+                else:
+                    input_ids = torch.tensor(base_input_ids, dtype=torch.long)
+                    loss_mask = torch.ones(input_ids.shape, dtype=torch.bool)
+                    return {
+                        "input_ids": input_ids,
+                        "labels": torch.tensor(labels, dtype=torch.long),
+                        "loss_mask": loss_mask,
+                        "is_spec": False
+                    }
 
             except StopIteration:
                 self.iter = iter(self.dataset.shuffle(buffer_size=self.args.shuffle_buffer))
@@ -109,15 +125,16 @@ class DynamicSpeculativeDataset(Dataset):
 
 
 def collate_fn(batch, tokenizer):
-    base_input_ids = [item["base_input_ids"] for item in batch]
-    input_ids = [item["input_ids"] for item in batch]
-    base_input_ids = torch.nn.utils.rnn.pad_sequence(
-        base_input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
-    )
-    input_ids = torch.nn.utils.rnn.pad_sequence(
-        input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
-    )
-    return {"base_input_ids": base_input_ids, "input_ids": input_ids}
+    return batch
+    # loss_mask = [item["loss_mask"] for item in batch]
+    # input_ids = [item["input_ids"] for item in batch]
+    # loss_mask = torch.nn.utils.rnn.pad_sequence(
+        # loss_mask, batch_first=True, padding_value=tokenizer.pad_token_id
+    # )
+    # input_ids = torch.nn.utils.rnn.pad_sequence(
+        # input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
+    # )
+    # return {"loss_mask": loss_mask, "input_ids": input_ids}
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -151,9 +168,9 @@ def parse_args():
     parser.add_argument("--warmup_ploss_weight", type=float, default=None, help="Weight for probability loss")
     parser.add_argument("--vloss_weight", type=float, default=0.01, help="Weight for hidden state loss")
     parser.add_argument("--ploss_weight", type=float, default=1.0, help="Weight for probability loss")
-    parser.add_argument("--bellman_weight", type=float, default=0.1)
-    parser.add_argument("--energy_rank_weight", type=float, default=0.05)
     parser.add_argument("--temperature", type=float, default=1.0, help="Distillation temperature")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of steps to accumulate gradients before optimizer step.")
     parser.add_argument("--lora_layer_ratio", type=float, default=0.25,
                         help="Ratio of layers (from the end) to apply LoRA. "
                              "e.g., 0.5 for last 50%% of layers. Default: 0.5")
@@ -338,6 +355,7 @@ def main():
     # === Dataset & DataLoader ===
     print("=== Dataset & DataLoader ===")
     train_dataset = DynamicSpeculativeDataset(tokenizer, args, skip_steps=step_offset)
+    assert(args.batch_size == 1)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -350,10 +368,12 @@ def main():
     print("=== Optimizer ===")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95), weight_decay=0.01)
     num_warmup_steps = int(args.num_steps*0.05)
+    total_update_steps = args.num_steps // args.gradient_accumulation_steps
+    num_warmup_updates = int(total_update_steps * 0.05)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=args.num_steps,
+        num_warmup_steps=num_warmup_updates,
+        num_training_steps=total_update_steps,
     )
 
     # If resuming, load optimizer state
@@ -398,11 +418,7 @@ def main():
             # past_key_values.crop(base_input_ids.shape[1] - args.spec_depth)  # [B, L, D]，或选某一层
             base_logits = base_outputs.logits  # [B, L, V]
             base_hidden = base_outputs.hidden_states  # [B, L, D]，或选某一层
-            # 从 base 模型提取 reward r
-            V_base = torch.logsumexp(base_logits, dim=-1)  # [B, L]
-            reward_r = base_logits - V_base.unsqueeze(-1)         # [B, L, V]
 
-        optimizer.zero_grad()
         st_outputs = model(
             # input_ids=input_ids[:, -args.spec_depth:],
             input_ids=input_ids,
@@ -413,55 +429,6 @@ def main():
         st_logits = st_outputs.logits  # [B, L, V]
         st_hidden = st_outputs.hidden_states
         vloss, ploss = compute_loss(base_hidden, base_logits, st_hidden, st_logits, args.hidden_layers, args.spec_depth, temperature=args.temperature)
-
-        # === Bellman loss (corrected) ===
-        V_student = torch.logsumexp(st_logits / args.temperature, dim=-1) * args.temperature  # [B, L]
-        # Align lengths: reward_r corresponds to base_logits[:, :-1] (shifted)
-        # Assume base_input_ids includes full sequence => ground truth next tokens are base_input_ids[:, 1:]
-        base_gt_tokens = base_input_ids[:, 1:]                     # [B, L_base-1]
-        base_logits_shifted = base_logits[:, :-1, :]               # [B, L_base-1, V]
-        reward_r_shifted = reward_r[:, :-1, :]                     # [B, L_base-1, V]
-
-        # For alignment, assume spec region in base corresponds to last args.spec_depth tokens
-        spec_start = -args.spec_depth
-        # Student spec logits (where it predicts draft tokens)
-        st_spec_logits = st_logits[:, spec_start:, :]              # [B, K, V]
-        # Base spec region (last K tokens of base response, excluding EOS if needed)
-        base_spec_reward = reward_r_shifted[:, spec_start:, :]     # [B, K, V]
-        base_spec_gt = base_gt_tokens[:, spec_start:]              # [B, K]
-
-        # Student-generated draft tokens (greedy)
-        student_spec_tokens = torch.argmax(st_spec_logits, dim=-1)  # [B, K]
-
-        # === Bellman loss: q_student ≈ r_base + V_student_next ===
-        V_student_spec_next = V_student[:, spec_start+1:]          # [B, K-1]
-        V_student_spec_next = torch.cat([V_student_spec_next, torch.zeros_like(V_student_spec_next[:, :1])], dim=1)  # pad last as 0
-        target_q = base_spec_reward + V_student_spec_next.unsqueeze(-1)  # [B, K, V]
-        bloss = F.smooth_l1_loss(
-            st_spec_logits,
-            target_q.detach(),
-            reduction="mean"
-        )
-
-        # === Energy Ranking Loss (EBM-consistent, reward-based) ===
-        # Total reward of base ground-truth path in spec region
-        R_base = torch.gather(
-            base_spec_reward,
-            dim=-1,
-            index=base_spec_gt.unsqueeze(-1)
-        ).squeeze(-1).sum(dim=-1)  # [B]
-
-        # Total reward of student draft path (evaluated under base reward r)
-        R_student = torch.gather(
-            base_spec_reward,
-            dim=-1,
-            index=student_spec_tokens.unsqueeze(-1)
-        ).squeeze(-1).sum(dim=-1)  # [B]
-
-        # Encourage student path to have reward ≥ base path - margin
-        margin = getattr(args, 'energy_ranking_margin', 1.0)
-        eloss = F.relu(margin + R_base.detach() - R_student).mean()
-
         vloss_weight = args.vloss_weight
         ploss_weight = args.ploss_weight
         if step < num_warmup_steps:
@@ -469,24 +436,22 @@ def main():
                 vloss_weight = args.warmup_vloss_weight
             if args.warmup_ploss_weight is not None:
                 ploss_weight = args.warmup_ploss_weight
-        loss = (
-            vloss * vloss_weight
-            + ploss * ploss_weight
-            + bloss * args.bellman_weight
-            + eloss * args.energy_rank_weight
-        )
-
+        loss = vloss * vloss_weight + ploss * ploss_weight
+        loss = loss / args.gradient_accumulation_steps
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+
+        # --- 只在累积步更新 ---
+        if (step + 1) % args.gradient_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()  # 清零梯度，开始下一轮累积
+
         if rank == 0 and step % args.logging_steps == 0:
-            print(f"Step {step}, LR: {scheduler.get_last_lr()[0]:.2e}, Loss: {loss.item():.4f}, VLoss: {vloss.item():.4f}, PLoss: {ploss.item():.4f}, BLoss: {bloss.item():.4f}, ELoss: {eloss.item():.4f}")
+            print(f"Step {step}, LR: {scheduler.get_last_lr()[0]:.2e}, Loss: {loss.item():.4f}, VLoss: {vloss.item():.4f}, PLoss: {ploss.item():.4f}")
             writer.add_scalar("Loss/Total", loss.item(), step)
             writer.add_scalar("Loss/VLoss", vloss.item(), step)
             writer.add_scalar("Loss/PLoss", ploss.item(), step)
-            writer.add_scalar("Loss/BLoss", bloss.item(), step)
-            writer.add_scalar("Loss/ELoss", eloss.item(), step)
             writer.add_scalar("LR", scheduler.get_last_lr()[0], step)
 
         if rank == 0 and step > 0 and step % args.save_steps == 0:
