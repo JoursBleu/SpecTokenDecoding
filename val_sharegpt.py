@@ -199,27 +199,11 @@ def main():
     ).to(device).eval()
 
     # === Load draft model ===
-    draft_base = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
+    draft_model = AutoModelForCausalLM.from_pretrained(
+        args.draft_model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-    )
-    if args.use_lora:
-        draft_model = PeftModel.from_pretrained(draft_base, args.draft_model_path)
-        draft_model = draft_model.merge_and_unload()
-    else:
-        state_dict = torch.load(os.path.join(args.draft_model_path, "pytorch_model.bin"), map_location="cpu")
-        draft_base.load_state_dict(state_dict)
-        draft_model = draft_base
-    draft_model = draft_model
-
-    # Load base model's trainable params (e.g., spec_embed_tokens)
-    print("load trainable params")
-    trainable_path = os.path.join(args.draft_model_path, "trainable_base_params.bin")
-    if os.path.exists(trainable_path):
-        trainable_state = torch.load(trainable_path, map_location="cpu")
-        draft_model.model.spec_embed_tokens.data = trainable_state['base_model.model.model.spec_embed_tokens']
-    draft_model.to(device).eval()
+    ).to(device).eval()
 
 
     # === Load dataset ===

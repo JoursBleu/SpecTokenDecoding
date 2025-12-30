@@ -12,7 +12,7 @@ export CKPT_PATH=$4
 
 python val_sharegpt_raw.py \
   --model_name /lpai/volumes/lpai-yharnam-lx-my/lt/models/Llama-3.1-8B-Instruct \
-  --draft_model_path ./${CKPT_PATH}/step_${STEP} \
+  --draft_model_path ./${CKPT_PATH}/checkpoint-${STEP} \
   --dataset_name ../data/ShareGPT_Vicuna_unfiltered \
   --dataset_split "train" \
   --use_lora \
