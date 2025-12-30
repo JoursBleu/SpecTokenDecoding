@@ -109,6 +109,24 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
+def color_accepted_tokens(target_tokens, spec_tokens, tokenizer):
+    target_tokens = target_tokens[0].tolist()  # 假设 batch_size=1
+    spec_tokens = spec_tokens[0].tolist()
+    min_len = min(len(target_tokens), len(spec_tokens))
+    
+    colored_parts = []
+    for i in range(len(target_tokens)):
+        tok_id = target_tokens[i]
+        tok_str = tokenizer.convert_ids_to_tokens(tok_id)
+        # 解码单个 token 并处理特殊符号（如开头有 Ġ 表示空格）
+        decoded = tokenizer.decode([tok_id], skip_special_tokens=False)
+        if i < min_len and target_tokens[i] == spec_tokens[i]:
+            # 红色
+            colored_parts.append(f"\033[31m{decoded}\033[0m")
+        else:
+            colored_parts.append(decoded)
+    return "".join(colored_parts)
+
 @torch.no_grad()
 def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer, device):
     """
@@ -123,7 +141,7 @@ def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer
         max_new_tokens=spec_depth+1,
         pad_token_id=draft_model.config.pad_token_id,
         eos_token_id=draft_model.config.eos_token_id,
-    )  # [1, C + K]
+    )[:, -spec_depth-1:]  # [1, C + K]
 
     # Step 2: Target model predicts K tokens
     target_tokens = draft_model.generate(
@@ -132,25 +150,35 @@ def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer
         max_new_tokens=spec_depth+1,
         pad_token_id=draft_model.config.pad_token_id,
         eos_token_id=draft_model.config.eos_token_id,
-    )  # [1, C + K]
+    )[:, -spec_depth-1:]  # [1, C + K]
 
     # Step 2: Draft model predicts K tokens
-    logits = draft_model(input_ids=input_ids).logits
-    spec_tokens = torch.argmax(logits, dim=-1)
+    logits = draft_model(input_ids=input_ids).logits[:, -spec_depth-1:]
+    score = torch.softmax(logits, dim=-1) # [bs, seqlen]
+    spec_tokens = torch.argmax(logits, dim=-1) # [bs, seqlen, voc_size]
+    spec_scores = torch.gather(score, dim=-1, index=spec_tokens.unsqueeze(-1)).squeeze(-1)
 
-    aligned_base = (target_tokens[:, -spec_depth-1:] == base_tokens[:, -spec_depth-1:]).sum().item()
-    accepted = (target_tokens[:, -spec_depth-1:] == spec_tokens[:, -spec_depth-1:]).sum().item()
-    print("base", base_tokens[:, -spec_depth-1:])
-    print("base text:", tokenizer.decode(base_tokens[0, -spec_depth-1:]))
-    print("target", target_tokens[:, -spec_depth-1:])
-    print("target text:", tokenizer.decode(target_tokens[0, -spec_depth-1:]))
-    print("draft", spec_tokens[:, -spec_depth-1:])
-    print("draft text:", tokenizer.decode(spec_tokens[0, -spec_depth-1:]))
+    aligned_base = (target_tokens == base_tokens).sum().item()
+    accepted = (target_tokens == spec_tokens).sum().item()
+
+    high_spec_scores = spec_scores > 0.7
+    high_score = (torch.cumprod(high_spec_scores[:, 1:], dim=-1)).sum(dim=1).item()
+    high_score_accepted = min(high_score, accepted-1)
+
+    print("base", base_tokens)
+    print("base text:", tokenizer.decode(base_tokens[0]))
+    print("target", target_tokens)
+    print("target text:", tokenizer.decode(target_tokens[0]))
+    print("draft", spec_tokens)
+    print("draft score", spec_scores)
+    print("draft text:", tokenizer.decode(spec_tokens[0]))
     
     print("aligned_base", aligned_base)
     print("accepted", accepted)
+    print("high_score", high_score)
+    print("high_score_accepted", high_score_accepted)
 
-    return accepted, aligned_base
+    return accepted, aligned_base, high_score, high_score_accepted
 
 def main():
     args = parse_args()
@@ -198,30 +226,37 @@ def main():
     total_aligned = 0
     total_drafts = 0
     count = 0
+    total_high_score = 0.0001
+    total_high_score_accepted = 0.0001
 
     print(f"Evaluating {args.num_samples} samples...")
     for batch in dataloader:
         if count >= args.num_samples:
             break
 
-        accepted, aligned_base = speculative_decode(
+        accepted, aligned_base, high_score, high_score_accepted = speculative_decode(
             base_model, draft_model, batch["input_ids"], args.spec_depth, tokenizer, device
         )
         total_accepted += accepted
         total_drafts += args.spec_depth + 1
         total_aligned += aligned_base
+        total_high_score += high_score
+        total_high_score_accepted += high_score_accepted
         count += 1
 
-        print(f"Processed {count} samples, current acceptance rate: {total_accepted / total_drafts:.2%}, current aligned rate: {total_aligned / total_drafts:.2%}")
+        acceptance_rate = total_accepted / total_drafts
+        avg_accepted_per_step = total_accepted / count
+        high_score_accept_rate = (total_high_score_accepted / total_high_score)
 
-    acceptance_rate = total_accepted / total_drafts
-    avg_accepted_per_step = total_accepted / count
+        print(f"Processed {count} samples, current acceptance rate: {acceptance_rate:.2%}, current aligned rate: {total_aligned / total_drafts:.2%}, high score avg count: {total_high_score / count:.2}, high score accept rate: {high_score_accept_rate:.2%}")
+
 
     print("\n" + "="*50)
     print(f"Speculative Decoding Evaluation Results")
     print(f"Spec depth: {args.spec_depth}")
     print(f"Samples: {count}")
     print(f"Average accepted tokens per draft: {avg_accepted_per_step:.2f} / {args.spec_depth+1}")
+    print(f"Average accepted tokens high score: {high_score_accept_rate:.2}")
     print(f"Acceptance rate: {acceptance_rate:.2%}")
     print(f"Average aligned tokens: {total_aligned / count:.3}")
     print("="*50)

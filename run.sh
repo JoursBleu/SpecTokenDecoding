@@ -18,11 +18,10 @@ torchrun \
   --learning_rate 5e-5 \
   --vloss_weight 100.0 \
   --ploss_weight 1.0 \
-  --bellman_weight 0.1 \
-  --energy_rank_weight 0.005 \
   --hidden_layers -1 -2 \
   --max_context 2048 \
   --spec_depth ${SPEC_LEN} \
+  --gradient_accumulation_steps 4 \
   --batch_size 1 \
   --num_steps 100000 \
   --save_steps 1000 \
