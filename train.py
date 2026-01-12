@@ -13,7 +13,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-
+from torch.distributed import get_world_size
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -26,6 +26,7 @@ def parse_args():
                         help="Checkpoint output directory")
 
     # ===== training =====
+    parser.add_argument("--world_size", type=int, default=8)
     parser.add_argument("--per_device_train_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
@@ -212,9 +213,31 @@ def main():
         remove_columns=dataset.column_names,
         num_proc=8,
     )
-    dataset = dataset.filter(lambda x: x is not None and "input_ids" in x and x["input_ids"] is not None)
+    dataset = dataset.filter(
+        lambda x: (x is not None
+            and "input_ids" in x and x["input_ids"] is not None
+            and "attention_mask" in x and x["attention_mask"] is not None
+            and "labels" in x and x["labels"] is not None
+        )
+    )
+    world_size = args.world_size
+    total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
+
+    # 确保总样本数能被 total_batch_size 整除
+    total_samples = len(dataset)
+    # adjust_samples = (total_samples // total_batch_size) * total_batch_size
+    adjust_samples = (total_samples // total_batch_size) * total_batch_size
+    dataset = dataset.select(range(adjust_samples))
     # for item in dataset:
         # breakpoint()
+
+    print("world_size", world_size)
+    print("args.per_device_train_batch_size", args.per_device_train_batch_size)
+    print("args.gradient_accumulation_steps", args.gradient_accumulation_steps)
+    print("total_samples", total_samples)
+    print("total_batch_size", total_batch_size)
+    print("adjust_samples", adjust_samples)
+    print("len(dataset)", len(dataset))
 
     ds_config = load_ds_config(args)
 
@@ -229,7 +252,7 @@ def main():
         num_train_epochs=args.num_train_epochs,
         lr_scheduler_type="cosine",
         warmup_ratio=args.warmup_ratio,
-        logging_steps=10,
+        logging_steps=args.gradient_accumulation_steps*10,
         save_steps=5000,
         bf16=True,
         deepspeed=ds_config,
@@ -255,6 +278,7 @@ def main():
 
     trainer.train()
     trainer.save_model()
+    tokenizer.save_pretrained(args.output_dir)
 
 if __name__ == "__main__":
     main()

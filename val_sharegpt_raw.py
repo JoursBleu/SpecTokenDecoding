@@ -128,38 +128,44 @@ def color_accepted_tokens(target_tokens, spec_tokens, tokenizer):
     return "".join(colored_parts)
 
 @torch.no_grad()
-def speculative_decode(base_model, draft_model, input_ids, spec_depth, tokenizer, device):
+def speculative_decode(base_model, draft_model, input_ids_org, spec_depth, tokenizer, device):
     """
     Simulate speculative decoding with ground-truth future for acceptance rate calculation.
     """
-    input_ids = input_ids.to(device)  # [C]
+    input_ids = input_ids_org.to(device)  # [C]
+    input_len = input_ids_org.shape[1] - spec_depth
 
     # Step 1: Base model predicts K tokens
     base_tokens = base_model.generate(
-        input_ids[:, :-spec_depth],
+        input_ids[:, :input_len],
         do_sample=False,
         max_new_tokens=spec_depth+1,
         pad_token_id=draft_model.config.pad_token_id,
         eos_token_id=draft_model.config.eos_token_id,
-    )[:, -spec_depth-1:]  # [1, C + K]
+    )[:, input_len:]  # [1, C + K]
 
     # Step 2: Target model predicts K tokens
     target_tokens = draft_model.generate(
-        input_ids[:, :-spec_depth],
+        input_ids[:, :input_len],
         do_sample=False,
         max_new_tokens=spec_depth+1,
         pad_token_id=draft_model.config.pad_token_id,
         eos_token_id=draft_model.config.eos_token_id,
-    )[:, -spec_depth-1:]  # [1, C + K]
+    )[:, input_len:]  # [1, C + K]
 
     # Step 2: Draft model predicts K tokens
-    logits = draft_model(input_ids=input_ids).logits[:, -spec_depth-1:]
+    logits = draft_model(input_ids=input_ids).logits[:, input_len-1:]
     score = torch.softmax(logits, dim=-1) # [bs, seqlen]
     spec_tokens = torch.argmax(logits, dim=-1) # [bs, seqlen, voc_size]
     spec_scores = torch.gather(score, dim=-1, index=spec_tokens.unsqueeze(-1)).squeeze(-1)
 
-    aligned_base = (target_tokens == base_tokens).sum().item()
-    accepted = (target_tokens == spec_tokens).sum().item()
+    if target_tokens.shape[1] == base_tokens.shape[1]:
+        aligned_base = (target_tokens == base_tokens).sum().item()
+    else:
+        aligned_base = 0
+    accepted = (target_tokens == spec_tokens[:, :target_tokens.shape[1]]).sum().item()
+    if accepted < 1:
+        breakpoint()
 
     high_spec_scores = spec_scores > 0.7
     high_score = (torch.cumprod(high_spec_scores[:, 1:], dim=-1)).sum(dim=1).item()
